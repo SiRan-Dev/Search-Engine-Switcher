@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Search Engine Switcher
 // @namespace    https://github.com/EchoRan6319/Search-Engine-Switcher
-// @version      2.6.0
+// @version      2.6.1
 // @description  快捷搜索引擎切换器：支持新增、删除、排序、位置自定义
 // @author       EchoRan6319
 // @license      MIT
@@ -22,8 +22,8 @@
 
   const STORAGE_KEY = 'search_engine_switcher_config_v1';
   const VERSION_KEY = 'search_engine_switcher_version';
-  const CURRENT_VERSION = '2.6.0';
-  const PRESET_VERSION = 2;
+  const CURRENT_VERSION = '2.6.1';
+  const PRESET_VERSION = 3;
   const STYLE_ID = 'search-engine-switcher-style';
   const ROOT_ID = 'search-engine-switcher-root';
   const PANEL_ID = 'search-engine-switcher-panel';
@@ -50,7 +50,7 @@
         id: 'duckduckgo',
         name: 'DuckDuckGo',
         searchUrl: 'https://duckduckgo.com/?q={q}',
-        hosts: ['duckduckgo.com'],
+        hosts: ['duckduckgo.com', 'html.duckduckgo.com', 'lite.duckduckgo.com'],
         hidden: false
       },
       {
@@ -287,6 +287,10 @@
     chatgpt: {
       hosts: [['chatgpt.com']]
     },
+    // v2.6.1：DuckDuckGo 补充 html/lite 搜索版站点
+    duckduckgo: {
+      hosts: [['duckduckgo.com']]
+    },
     // v2.4.0 之前的历史值：通义千问已迁移为 qianwen.com
     qianwen: {
       urls: ['https://tongyi.aliyun.com/qianwen/?q={q}', 'https://tongyi.aliyun.com/qianwen?q={q}'],
@@ -328,6 +332,25 @@
       }
     }
     cfg.presetVersion = PRESET_VERSION;
+    return true;
+  }
+
+  // 搜索地址安全校验：只拦截会执行脚本的危险 scheme（javascript:/data:/vbscript: 等）；
+  // 相对路径、http(s)、自定义 scheme/本地地址一律保留，避免误删用户配置。
+  function isSafeSearchUrl(searchUrl) {
+    const value = String(searchUrl || '').trim();
+    if (!value) return false;
+    // 浏览器解析 URL 时会忽略 tab/换行等控制字符，这里先归一化再判断
+    const normalized = value.replace(/[\u0000-\u0020]/g, '').toLowerCase();
+    if (
+      normalized.startsWith('javascript:') ||
+      normalized.startsWith('data:') ||
+      normalized.startsWith('vbscript:') ||
+      normalized.startsWith('filesystem:') ||
+      normalized.startsWith('blob:')
+    ) {
+      return false;
+    }
     return true;
   }
 
@@ -690,6 +713,8 @@
   let renderedSignature = '';
   let dragModeActive = false;
   let actionBusy = false;
+  let lastActionAt = 0;
+  let lastActionEngineId = '';
   let selectionTimer = null;
   let resizeTimer = null;
   let renderQueued = false;
@@ -697,7 +722,15 @@
   function cleanQuery(value) {
     if (value == null) return '';
     const text = String(value).replace(/\s+/g, ' ').trim();
-    return text.length > QUERY_MAX_LENGTH ? text.slice(0, QUERY_MAX_LENGTH) : text;
+    // 按码点遍历，避免把 emoji 等代理对切断；同时丢弃孤立代理项（会导致 encodeURIComponent 抛错）
+    let result = '';
+    for (const char of text) {
+      const codePoint = char.codePointAt(0);
+      if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue;
+      if (result.length + char.length > QUERY_MAX_LENGTH) break;
+      result += char;
+    }
+    return result;
   }
 
   function decodeUriSafe(value) {
@@ -735,12 +768,39 @@
     return h === p ? 10000 + p.length : p.length;
   }
 
+  // 自定义引擎如果没填识别域名，退化为使用 searchUrl 模板里的域名，避免“在它自己的站点上却不显示悬浮窗”
+  function getEngineHostPatterns(engine) {
+    const patterns = engine.hosts && engine.hosts.length ? engine.hosts.slice() : [];
+    if (patterns.length) return patterns;
+    const template = getTemplate(engine.searchUrl);
+    if (!template) return patterns;
+    patterns.push(template.host);
+    const bareHost = stripHostPrefix(template.host);
+    if (bareHost !== template.host) patterns.push(bareHost);
+    return patterns;
+  }
+
   // 同一域名被多个引擎命中时，取“最具体”的那个（如 weixin.sogou.com 优先于 sogou.com）
   function findEngineByHost(host) {
+    // 第一遍只用显式配置的 hosts，避免“没填域名、自动回退模板域名”的自定义引擎抢占同名预设
     let matched = null;
     let bestScore = -1;
     for (const engine of config.engines) {
-      for (const pattern of engine.hosts || []) {
+      if (!engine.hosts || engine.hosts.length === 0) continue;
+      for (const pattern of engine.hosts) {
+        const score = hostMatchScore(host, pattern);
+        if (score > bestScore) {
+          bestScore = score;
+          matched = engine;
+        }
+      }
+    }
+    if (matched) return matched;
+
+    // 第二遍：hosts 为空的自定义引擎，用 searchUrl 模板里的域名兜底
+    for (const engine of config.engines) {
+      if (engine.hosts && engine.hosts.length) continue;
+      for (const pattern of getEngineHostPatterns(engine)) {
         const score = hostMatchScore(host, pattern);
         if (score > bestScore) {
           bestScore = score;
@@ -811,17 +871,27 @@
     return h;
   }
 
+  // 国家/地区域名变体允许的第二级标签（如 google.co.uk 里的 co）；用于拒绝 google.evil.com 这类伪造域
+  const SECOND_LEVEL_DOMAIN_LABELS = new Set([
+    'co', 'com', 'net', 'org', 'gov', 'edu', 'ac', 'or', 'ne', 'go', 'gr', 'lg', 'mil', 'sch', 'ltd', 'plc'
+  ]);
+
   // 判断当前 host 是否就是模板里的搜索引擎站点（含国家/地区域名变体，排除 mail/docs 等子域）
   function isTemplateHost(host, templateHost) {
     if (!host || !templateHost) return false;
     const h = stripHostPrefix(host);
     const t = stripHostPrefix(templateHost);
-    if (h === t || h.startsWith(`${t}.`)) return true;
-    // 国家/地区域名变体：www.google.com.hk / google.co.uk 对应模板 www.google.com
+    if (h === t) return true;
+
+    // 国家/地区域名变体：google.de / google.co.uk / google.com.hk。
+    // 只接受 templateHost 为 base.tld 且当前 host 为 base.ccTLD 或 base.sld.ccTLD 的形态，
+    // 因此 google.evil.com、google.com.evil.com 这类伪造域不会被当成引擎站点。
     const hostParts = h.split('.');
     const templateParts = t.split('.');
-    if (templateParts.length === 2 && hostParts.length >= 2 && hostParts[0] === templateParts[0]) return true;
-    return false;
+    if (templateParts.length !== 2 || hostParts.length < 2 || hostParts.length > 3) return false;
+    if (hostParts[0] !== templateParts[0]) return false;
+    if (hostParts.length === 2) return /^[a-z]{2}$/i.test(hostParts[1]);
+    return SECOND_LEVEL_DOMAIN_LABELS.has(hostParts[1].toLowerCase()) && /^[a-z]{2}$/i.test(hostParts[2]);
   }
 
   function pathMatchesTemplate(templatePath, path) {
@@ -927,6 +997,9 @@
     return extractGenericQuery(url);
   }
 
+  // 站点型引擎（模板 path 为 '/'）里明显不是问答/搜索界面的功能页，避免登录/设置页划词也弹窗
+  const APP_ENGINE_UTILITY_PATH = /^\/(?:login|logout|signin|sign_in|sign-in|signup|sign_up|sign-up|register|auth|oauth|sso|account|accounts|profile|user|users|onboarding|verify|verification|invite|download|blog|careers|jobs|status|security|cookies|upgrade|subscription|settings|preferences|billing|pricing|plans|subscribe|help|about|terms|privacy|legal|docs|support|contact|changelog)(?:\/|$)/i;
+
   // 是否为“该引擎自己的站点页面”（而不是 Gmail / 百度百科 / Google 翻译这类同域其他产品）。
   // 模板 path 为 '/' 的站点型引擎（ChatGPT/DeepSeek/Kimi 等）视为站内任意页面都属于引擎页；
   // 搜索型引擎（Google/Bing/百度等）只认首页、搜索路径及其子路径。
@@ -945,7 +1018,10 @@
       const prefix = normalizePath(template.prefix);
       return path === '/' || path === prefix || path.startsWith(`${prefix}/`);
     }
-    if (template.pathname === '/') return true; // 站点型引擎：整站都是问答/搜索界面
+    if (template.pathname === '/') {
+      // 站点型引擎：整站都是问答/搜索界面，但登录、设置、定价等工具页除外
+      return !APP_ENGINE_UTILITY_PATH.test(url.pathname);
+    }
     return path === '/' || path === template.pathname || path.startsWith(`${template.pathname}/`);
   }
 
@@ -1029,11 +1105,26 @@
 
   // ==================== 动作 ====================
 
+  function encodeQuery(query) {
+    try {
+      return encodeURIComponent(query);
+    } catch (_) {
+      // 理论上 cleanQuery 已去掉孤立代理项；这里再兜底一次，避免点击静默失败
+      return encodeURIComponent(String(query).replace(/[\uD800-\uDFFF]/g, ''));
+    }
+  }
+
   function buildSearchUrl(engine, query) {
-    return engine.searchUrl.split('{q}').join(encodeURIComponent(query));
+    return engine.searchUrl.split('{q}').join(encodeQuery(query));
   }
 
   function openTargetUrl(targetUrl, forceNewTab) {
+    // 防御 http(s) 之外的恶意 scheme（配置可能来自旧版本或导入文件），但不删除用户配置
+    if (!isSafeSearchUrl(targetUrl)) {
+      console.warn('[Search Engine Switcher] 已阻止不安全的搜索引擎地址:', targetUrl);
+      alert('该搜索引擎的地址不安全（javascript:/data: 等协议），已阻止打开。请到设置面板中修改它。');
+      return;
+    }
     const useNewTab = typeof forceNewTab === 'boolean' ? forceNewTab : !!config.ui.openInNewTab;
     if (!useNewTab) {
       window.location.assign(targetUrl);
@@ -1057,21 +1148,32 @@
     window.location.assign(targetUrl);
   }
 
-  async function handleAction(engine, forceNewTab) {
+  function handleAction(engine, forceNewTab) {
+    const now = Date.now();
     if (actionBusy) return;
+    // 同一引擎 400ms 内的重复点击视为双击，避免打开两个标签页；点不同引擎不受影响
+    if (engine && engine.id === lastActionEngineId && now - lastActionAt < 400) return;
     actionBusy = true;
     try {
-      let query = '';
-      if (currentWidgetMode === 'selection' && lastSelectedText) query = lastSelectedText;
-      if (!query) query = extractQuery(new URL(location.href), findEngineByHost(location.hostname));
-      if (!query) query = readSelection();
-      if (!query) query = readFocusedInput();
-      if (!query) {
-        const input = prompt('输入搜索关键词');
-        query = cleanQuery(input);
+      // 选区优先：在结果页选中文字后切换引擎，应该搜索选中的文字（与“划词搜索”说明一致）；
+      // 没有选区时才回退到当前页面的搜索词，而“无关键词常显”模式不再用 URL 里的无关参数拼查询词。
+      let query = readSelection();
+      if (!query) query = lastSelectedText;
+      if (!query && currentWidgetMode === 'search') {
+        query = extractQuery(new URL(location.href), findEngineByHost(location.hostname));
       }
+      if (!query) query = readFocusedInput();
+      if (!query) query = cleanQuery(prompt('输入搜索关键词'));
       if (!query) return;
+      // 只有真正要打开时才记录时间，取消 prompt 不算一次点击，避免随后正常点击被防抖吞掉；
+      // 用 Date.now() 而非进入函数时的时间：prompt 停留超过 400ms 后排队触发的第二击也能被拦住
+      if (engine) {
+        lastActionAt = Date.now();
+        lastActionEngineId = engine.id;
+      }
       openTargetUrl(buildSearchUrl(engine, query), forceNewTab);
+    } catch (error) {
+      console.warn('[Search Engine Switcher] 打开搜索失败:', error);
     } finally {
       actionBusy = false;
     }
@@ -1209,7 +1311,9 @@
         void handleAction(engine);
       });
       button.addEventListener('mousedown', (e) => {
-        if (e.button === 1) e.preventDefault();
+        // 左键阻止默认的“点击折叠选区”：点 pill 时仍能读到用户选中的文字
+        // 中键阻止默认的自动滚动
+        if (e.button === 0 || e.button === 1) e.preventDefault();
       });
       button.addEventListener('auxclick', (e) => {
         if (e.button !== 1) return;
@@ -1245,7 +1349,9 @@
     const signature = `${state.activeId}|${state.query}`;
     if (force || signature !== renderedSignature) {
       renderedSignature = signature;
+      // 引擎按钮数量变化会改变控件宽度，自定义坐标需要重新做视口内钳制
       rebuildPills(state.activeId);
+      if (config.ui.useCustomXY) applyRootPosition(root);
     }
   }
 
@@ -1260,12 +1366,16 @@
 
   function onSelectionChanged() {
     if (config.ui.selectionTrigger === 'off') {
+      // 关闭划词时不让缓存选区影响之后的点击查询词
+      lastSelectedText = '';
       if (currentWidgetMode === 'selection') scheduleRender();
       return;
     }
     if (selectionTimer) clearTimeout(selectionTimer);
     selectionTimer = setTimeout(() => {
       selectionTimer = null;
+      // 缓存选区：点击 pill 时 mousedown 可能先把选区折叠掉，因此在事件处理前先记下来
+      lastSelectedText = readSelection();
       renderWidget();
     }, 180);
   }
@@ -1629,6 +1739,10 @@
       alert('URL 必须包含 {q} 占位符');
       return;
     }
+    if (!isSafeSearchUrl(trimmedUrl)) {
+      alert('搜索 URL 不能使用 javascript:/data: 等危险协议');
+      return;
+    }
     try {
       new URL(trimmedUrl.split('{q}').join('test'));
     } catch (_) {
@@ -1927,7 +2041,7 @@
           <p>为了避免打扰正常浏览，悬浮窗<strong>只在需要切换搜索引擎时出现</strong>：</p>
           <ul>
             <li><strong>搜索结果页</strong>：当页面网址里带有搜索关键词（如 <code>q=</code>、<code>wd=</code>、<code>text=</code>）时自动出现，方便一键切换到其他引擎。</li>
-            <li><strong>划词搜索</strong>（默认开启，仅限搜索引擎页面）：在 Google、百度等引擎的首页或结果页选中文字后出现，可把选中的文字直接带去其他引擎搜索。可在 <strong>设置 → 行为选项 → 选中文字时</strong> 改为“不显示”或“所有网站”。</li>
+            <li><strong>划词搜索</strong>（默认开启，仅限搜索引擎页面）：在 Google、百度等引擎的首页或结果页选中文字后出现，可把选中的文字直接带去其他引擎搜索；<strong>在结果页选中文字时优先搜索选中的文字</strong>（没有选区才沿用当前页面的搜索词）。可在 <strong>设置 → 行为选项 → 选中文字时</strong> 改为“不显示”或“所有网站”。</li>
             <li><strong>无关键词时</strong>：该选项可选“仍然显示切换器”，让该引擎的首页/搜索页常驻悬浮窗（默认隐藏）。</li>
           </ul>
           <p>以下页面<strong>不会</strong>出现悬浮窗：普通网页、Gmail / Google 文档 / 百度百科 / 贴吧这类“虽然属于某引擎域名、但并不是搜索页”的页面，以及您在设置中“禁用悬浮”的站点。</p>
@@ -1999,13 +2113,16 @@
       config.ui.enabled = config.ui.enabled === false;
       saveConfig(config);
       applyUiSettings();
+      // 如果设置面板正开着，同步“悬浮窗”下拉框，避免随后点保存把菜单切换覆盖回去
+      const enabledSelect = document.querySelector(`#${PANEL_ID} #ses-enabled`);
+      if (enabledSelect) enabledSelect.value = config.ui.enabled === false ? '0' : '1';
     });
   }
 
   function installHistoryHooks() {
     // 部分 SPA（如 YouTube）用 history.pushState 换页且不派发事件，包装后立即刷新状态
-    try {
-      for (const method of ['pushState', 'replaceState']) {
+    for (const method of ['pushState', 'replaceState']) {
+      try {
         const original = window.history && window.history[method];
         if (typeof original !== 'function' || original.__sesWrapped) continue;
         const wrapped = function (...args) {
@@ -2015,9 +2132,9 @@
         };
         wrapped.__sesWrapped = true;
         window.history[method] = wrapped;
+      } catch (_) {
+        // 单个方法包装失败不影响另一个方法，URL 轮询兜底仍然存在
       }
-    } catch (_) {
-      // ignore
     }
   }
 
